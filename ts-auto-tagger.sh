@@ -2,6 +2,22 @@
 
 CONFIG_FILE="config.cfg"
 
+# Function to handle tag errors
+handle_tag_error() {
+    local response="$1"
+    if [[ "$response" =~ "invalid or not permitted" ]]; then
+        echo -e "\e[33mError: The specified tag(s) are not defined in your Tailscale ACL policy.\e[0m"
+        echo -e "To fix this:"
+        echo "1. Open your Tailscale ACL policy file"
+        echo "2. Add the tag(s) to the 'tagOwners' section like this:"
+        echo -e "   \"tagOwners\": {\n     \"tag:NAME\": [\"autogroup:admin\"],\n     ...\n   }"
+        echo "3. Push/submit the updated ACL policy"
+        echo "4. Try applying the tags again"
+        return 1
+    fi
+    return 0
+}
+
 # Default connection settings if not in config
 DEFAULT_CONNECT_TIMEOUT=60
 DEFAULT_MAX_TIME=120
@@ -17,7 +33,7 @@ MATCH_BY="name"  # Default match by name
 # Function to list all devices
 list_devices() {
     echo "Fetching devices from Tailscale..."
-    response=$(curl -s -w "\n%{http_code}" \
+    response=$(curl -s \
         --connect-timeout "$(printf '%.0f' "$CONNECT_TIMEOUT")" \
         --max-time "$(printf '%.0f' "$MAX_TIME")" \
         --retry "$(printf '%.0f' "$RETRY")" \
@@ -29,10 +45,161 @@ list_devices() {
     
     if [ $? -eq 0 ]; then
         echo "Available devices:"
-        echo "$response" | jq -r '.devices[] | "\(.name) (\(.addresses[0])) - Tags: \(.tags[]?)"'
+        if echo "$response" | jq -e '.devices' >/dev/null 2>&1; then
+            echo "$response" | jq -r '.devices[] | "\(.name) (\(.addresses[0])) - Tags: \(.tags[]?)"'
+        else
+            echo "Error: Invalid response format"
+            echo "$response" | jq '.' 2>/dev/null || echo "$response"
+        fi
     else
         echo "Error fetching devices"
     fi
+}
+
+collect_tags() {
+    tags=()
+    echo -e "\nNow, let's set ACL Tags for each pattern..."
+    
+    for i in "${!custom_values[@]}"; do
+        local pattern="${custom_values[i]}"
+        echo -e "\nSetting up tags for pattern: '$pattern'"
+        local tag_list=()
+        
+        fetch_available_tags
+        
+        while true; do
+            echo -e "\nEnter tag name (without 'tag:' prefix, or empty to finish):"
+            echo "You can either select an existing tag number or type a new tag name."
+            read tag_name
+            
+            if [ -z "$tag_name" ]; then
+                break
+            fi
+            
+            # Check if input is a number referring to an existing tag
+            if [[ "$tag_name" =~ ^[0-9]+$ ]]; then
+                if [ "$tag_name" -le "${#available_tags[@]}" ] && [ "$tag_name" -gt 0 ]; then
+                    tag_name="${available_tags[$((tag_name-1))]}"
+                else
+                    echo "Invalid tag number. Please try again."
+                    continue
+                fi
+            fi
+            
+            # Validate tag name
+            if [[ $tag_name =~ ^[a-zA-Z0-9_-]+$ ]]; then
+                tag_list+=("tag:$tag_name")
+                echo -e "\e[32mAdded tag: $tag_name\e[0m"
+            else
+                echo "Invalid tag name. Use only letters, numbers, underscores, and hyphens."
+            fi
+        done
+        
+        if [ ${#tag_list[@]} -gt 0 ]; then
+            tags+=("${tag_list[*]}")
+            export "TAGS_$((i+1))=${tag_list[*]}"
+            echo -e "\e[32mTags setup complete for '$pattern': ${tag_list[*]}\e[0m"
+        else
+            echo "No tags were added for this pattern."
+            tags+=("")
+            export "TAGS_$((i+1))="
+        fi
+    done
+}
+
+# Function to fetch and display available ACL tags
+fetch_available_tags() {
+    echo "Fetching available ACL tags from Tailscale..."
+    local api_response=$(curl -s \
+        --connect-timeout "$(printf '%.0f' "$CONNECT_TIMEOUT")" \
+        --max-time "$(printf '%.0f' "$MAX_TIME")" \
+        --retry "$(printf '%.0f' "$RETRY")" \
+        --retry-delay "$(printf '%.0f' "$RETRY_DELAY")" \
+        --retry-max-time "$(printf '%.0f' "$RETRY_MAX_TIME")" \
+        --request GET \
+        --url "https://api.tailscale.com/api/v2/tailnet/${TAILNET_ORG}/devices" \
+        --header "Authorization: Bearer ${API_KEY}")
+    
+    if [ $? -eq 0 ]; then
+        echo -e "\nExisting ACL tags in use:"
+        available_tags=($(echo "$api_response" | jq -r '.devices[].tags[]?' | sort -u | sed 's/^tag://'))
+        if [ ${#available_tags[@]} -gt 0 ]; then
+            printf '%s\n' "${available_tags[@]}" | nl -w2 -s'. '
+        else
+            echo "No existing ACL tags found."
+        fi
+    else
+        echo "Error fetching ACL tags"
+    fi
+}
+
+apply_tags() {
+    echo -e "\nReady to apply the following tags:"
+    for i in "${!custom_values[@]}"; do
+        echo -e "\nPattern: '${custom_values[i]}'"
+        IFS=' ' read -r -a tag_array <<< "${tags[i]}"
+        echo "└─ Tags: ${tag_array[*]}"
+    done
+
+    echo -n -e "\nDo you want to proceed with applying these tags? (y/n): "
+    read confirm
+    if [[ ! "$confirm" =~ ^[Yy] ]]; then
+        echo "Operation cancelled."
+        return 1
+    fi
+
+    for i in "${!custom_values[@]}"; do
+        if [ -f "nodeids_${custom_values[i]}.tmp" ]; then
+            while IFS= read -r line; do
+                for nodeid in $line; do
+                    echo "Applying tags to device $nodeid..."
+                    
+                    # Prepare JSON data for tags with proper formatting
+                    IFS=' ' read -r -a tag_array <<< "${tags[i]}"
+                    json_data="{\n  \"tags\": [\n"
+                    for ((j=0; j<${#tag_array[@]}; j++)); do
+                        json_data+="    \"${tag_array[j]}\""
+                        if [ $j -lt $((${#tag_array[@]}-1)) ]; then
+                            json_data+=","
+                        fi
+                        json_data+="\n"
+                    done
+                    json_data+="  ]\n}"
+                    
+                    url="https://api.tailscale.com/api/v2/device/${nodeid}/tags"
+                    log_debug "$url" "$json_data"
+                    response=$(curl -s \
+                        --connect-timeout "$(printf '%.0f' "$CONNECT_TIMEOUT")" \
+                        --max-time "$(printf '%.0f' "$MAX_TIME")" \
+                        --retry "$(printf '%.0f' "$RETRY")" \
+                        --retry-delay "$(printf '%.0f' "$RETRY_DELAY")" \
+                        --retry-max-time "$(printf '%.0f' "$RETRY_MAX_TIME")" \
+                        --request POST \
+                        --url "$url" \
+                        --header "Authorization: Bearer ${API_KEY}" \
+                        --header 'Content-Type: application/json' \
+                        --data-raw "$(echo -e "$json_data")")
+                    
+                    if [ "$response" = "null" ] || [ -z "$response" ]; then
+                        echo -e "\e[32m✓ Successfully applied tags to device $nodeid\e[0m"
+                    else
+                        echo -e "\e[31m✗ Failed to apply tags to device $nodeid\e[0m"
+                        echo -e "\e[33mResponse:\e[0m"
+                        echo "$response" | jq -r . 2>/dev/null || echo "$response"
+                        # Extract message field and check for error
+                        error_msg=$(echo "$response" | jq -r '.message' 2>/dev/null)
+                        if [[ "$error_msg" == *"invalid or not permitted"* ]]; then
+                            handle_tag_error "$error_msg"
+                            break 3  # Exit all loops after showing the error
+                        fi
+                    fi
+                    
+                    sleep 1
+                done
+            done < "nodeids_${custom_values[i]}.tmp"
+            rm "nodeids_${custom_values[i]}.tmp"
+        fi
+    done
 }
 
 # Function to display menu
@@ -286,9 +453,6 @@ collect_custom_values() {
     for i in "${!custom_values[@]}"; do
         get_matching_devices "${custom_values[i]}" "${case_sensitive_flags[i]}" "${exclude_values[i]}"
     done
-
-    # Add custom attributes collection
-    collect_custom_attributes
 }
 
 # Function to apply attributes to devices
@@ -556,8 +720,26 @@ while true; do
             echo -n "Do you want to start auto-tagging? (y/n): "
             read start_tagging
             if [[ "$start_tagging" =~ ^[Yy] ]]; then
-                collect_custom_values
-                apply_attributes
+                echo -e "\nChoose tagging type:"
+                echo "1. ACL Tags"
+                echo "2. Custom Attributes"
+                read -p "Enter choice (1-2): " tag_type
+                
+                case $tag_type in
+                    1)
+                        collect_custom_values
+                        collect_tags
+                        apply_tags
+                        ;;
+                    2)
+                        collect_custom_values
+                        collect_custom_attributes
+                        apply_attributes
+                        ;;
+                    *)
+                        echo "Invalid choice"
+                        ;;
+                esac
                 echo -e "\nAuto-tagging process complete!"
             fi
             ;;
@@ -573,12 +755,12 @@ while true; do
                 echo "Debug mode disabled"
             else
                 DEBUG_MODE=true
-                echo "Debug mode enabled - logging to $DEBUG_FILE"
+                echo "Debug mode enabled"
             fi
             update_config_file
             ;;
         0)
-            echo "Goodbye!"
+            echo "Exiting..."
             exit 0
             ;;
         *)
